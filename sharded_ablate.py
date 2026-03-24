@@ -357,12 +357,136 @@ def modify_tensor_householder(
 
     return result.detach().clone()
 
+def modify_tensor_directional_scaling(
+    W: torch.Tensor,
+    direction: torch.Tensor,
+    scale_factor: float = 1.0,
+) -> torch.Tensor:
+    """
+    Modify a weight tensor by scaling its response to a specific direction,
+    leaving all orthogonal directions untouched.
+
+    Applies the rank-1 update:
+
+        W_new = W + (scale_factor - 1) * (W @ s) ⊗ s
+
+    which is equivalent to: rotate so s aligns with a coordinate axis, scale
+    that axis by scale_factor, rotate back. The conjugation collapses to the
+    rank-1 form above, so no explicit rotation is required.
+
+    Follows abliteration convention for scale_factor:
+        scale_factor=1.0  →  full ablation: W_new @ s = 0 (default)
+        scale_factor=0.0  →  identity: W unchanged
+        scale_factor=-1.0 →  amplification: doubles the s component
+        0 < scale_factor < 1 →  partial attenuation
+        scale_factor < 0  →  amplification
+
+    Equivalent to a rank-1 LoRA update W + b ⊗ a with a=s and
+    b=-scale_factor*(W@s), i.e. the adapter weights are derived analytically
+    from the direction vector rather than learned. The only source of error
+    is in the measurement of the direction itself.
+
+    Layout convention:
+        Accepts both PyTorch [Out, In] and safetensors [In, Out] layouts
+        transparently via internal transpose to [In, Out] (or [Experts, In, Out]
+        for MoE tensors) before applying the operation.
+
+    Args:
+        W:            Weight tensor, shape [Out, In] or [In, Out] or
+                      [Experts, Out, In].
+        direction:    Direction vector to scale, shape [D] or broadcastable.
+                      Need not be unit norm; normalized internally.
+        scale_factor: Scaling coefficient along direction. Default 1.0 (full
+                      ablation). 0.0 is identity. See operating points above.
+
+    Returns:
+        Modified weight tensor, same shape and dtype as W.
+    """
+    original_dtype = W.dtype
+    device = get_preferred_device()
+
+    with torch.no_grad():
+        W_gpu = W.to(device, dtype=torch.float32, non_blocking=True)
+        W_rank = W.dim()
+
+        dir_gpu = direction.to(device, dtype=torch.float32, non_blocking=True)
+        if dir_gpu.dim() > 1:
+            dir_gpu = dir_gpu.view(-1)
+        s = torch.nn.functional.normalize(dir_gpu, dim=0)
+        del dir_gpu
+
+        # Transpose to [In, Out] or [Experts, In, Out] for consistent
+        # input-dim projection across both layout conventions.
+        if W_rank == 2:
+            W_working = W_gpu.T
+        elif W_rank == 3:
+            W_working = W_gpu.permute(0, 2, 1)
+        else:
+            print(f"Warning: Unsupported tensor shape {W_gpu.shape} - Skipping.")
+            return W
+        del W_gpu
+
+        # Rank-1 directional scaling:
+        #   W_new = W + (α - 1) * (W @ s) ⊗ s
+        #
+        # proj_s: [Out] for 2D, [Experts, Out] for 3D — the response of each
+        # output neuron to the direction s.
+        # The outer product with s redistributes the scaled delta back into
+        # the input space along s only.
+        W_norms_before = W_working.norm(dim=-1, keepdim=True)
+        valid_rows = W_norms_before > 1e-12
+
+        # Remap to abliteration convention: 1=full ablation, 0=identity, -1=amplification.
+        # alpha is the surviving fraction of the s component: alpha = 1 - scale_factor.
+        alpha_m1 = -scale_factor
+
+        proj_s = W_working @ s
+        W_working = W_working + alpha_m1 * proj_s.unsqueeze(-1) * s
+
+        # Double-tap: a second pass removes any residual s component left by
+        # floating point cancellation in the first, ensuring the projection is
+        # exact to machine precision. No-op when scale_factor=0 (identity).
+        proj_s = W_working @ s
+        W_working = W_working + alpha_m1 * proj_s.unsqueeze(-1) * s
+        del proj_s
+
+        # Norm preservation: the rank-1 update removes (or attenuates) the
+        # energy along s, shrinking each row. Renormalize each row back to its
+        # original norm so downstream activation magnitudes are unchanged.
+        # Rows that collapse to near-zero are left alone — there is no
+        # faithful direction to rescale into.
+        # Double-tap: second pass corrects any residual norm error from the first.
+        # scale_factor=0.0 is a no-op: norms_before == norms_after.
+        for _ in range(2):
+            W_norms_after = W_working.norm(dim=-1, keepdim=True)
+            renorm = torch.where(
+                valid_rows & (W_norms_after > 1e-12),
+                W_norms_before / W_norms_after,
+                torch.ones_like(W_norms_after)
+            )
+            W_working = W_working * renorm
+
+        # Transpose back to original layout convention.
+        if W_rank == 2:
+            result = W_working.T
+        elif W_rank == 3:
+            result = W_working.permute(0, 2, 1)
+
+        result = result.to('cpu', dtype=original_dtype, non_blocking=True)
+
+        del s, W_working
+        synchronize_device(device)
+        clear_device_cache()
+
+    return result.detach().clone()
+
 def ablate_by_layers_sharded(
     model_name: str,
     measures: dict,
     marching_orders: list,
     output_path: str,
     householder: bool,
+    directional: bool,
     norm_preserve: bool,
     projected: bool,
     ensemble: bool,
@@ -528,6 +652,12 @@ def ablate_by_layers_sharded(
                     scale *= large_scale
 
                     # Apply modification
+                    if directional:
+                        state_dict[key] = modify_tensor_directional_scaling(
+                            state_dict[key],
+                            refusal_dir,
+                            scale,
+                        ).contiguous()                        
                     if householder:
                         state_dict[key] = modify_tensor_householder(
                             state_dict[key],
@@ -612,7 +742,13 @@ def main():
         '--householder',
         action="store_true",
         default=False,
-        help='Use Householder reflection to ablate intervention',
+        help='Use Householder reflection to ablate intervention (not recommended)',
+    )
+    parser.add_argument(
+        '--directional',
+        action="store_true",
+        default=False,
+        help='Use directional scaling to ablate intervention',
     )
     parser.add_argument(
         '--normpreserve',
@@ -653,6 +789,7 @@ def main():
     print(f"Output directory: {output_dir}")
     print(f"Number of ablations: {len(ablations)}")
     print(f"Householder ablation: {args.householder}")
+    print(f"Directional ablation: {args.directional}")
     print(f"Norm preservation: {args.normpreserve}")
     print(f"Projected: {args.projected}")
     print(f"Layer ensemble: {args.layerensemble}")
@@ -689,6 +826,7 @@ def main():
         marching_orders=orders,
         output_path=output_dir,
         householder=args.householder,
+        directional=args.directional,
         norm_preserve=args.normpreserve,
         projected=args.projected,
         ensemble=args.layerensemble,

@@ -63,7 +63,47 @@ The measurement script autodetects 4-bit and 8-bit BitsAndBytes models and will 
 One can also specify `--quant 4bit` and `--quant 8bit` to force on-the-fly bitsandbytes quantization of full-weight models.
 However, subsequent ablation needs to be performed on full-weight models.
 
+By default, measurement now forces full-precision loading and ignores model-defined compression metadata.
+Use `--allow-model-compression` to permit repository-provided compression/quantization metadata when `--quant-measure` is not set.
+
 To orthogonalize the refusal direction against the harmless direction during measurement, specify `--projected`; otherwise the result will correspond to conventional abliteration.
+
+### Multi-node measurement with torchrun
+
+For models that require multi-server loading, measurement supports `torch.distributed`.
+Launch one process per GPU on each node using `torchrun` and rendezvous flags.
+
+Node 0:
+
+```shell
+torchrun \
+  --nnodes 2 \
+  --node-rank 0 \
+  --nproc-per-node 8 \
+  --master-addr 10.0.0.1 \
+  --master-port 29500 \
+  measure.py \
+  --dist \
+  -m <path_to_your_model> \
+  -o <output_file>
+```
+
+Node 1:
+
+```shell
+torchrun \
+  --nnodes 2 \
+  --node-rank 1 \
+  --nproc-per-node 8 \
+  --master-addr 10.0.0.1 \
+  --master-port 29500 \
+  measure.py \
+  --dist \
+  -m <path_to_your_model> \
+  -o <output_file>
+```
+
+In distributed mode, prompts are sharded by rank, layer-wise activation sums/counts are globally reduced, and only rank 0 saves the final measurement file.
 
 ### Analyze resulting measurements, with optional charting
 

@@ -1,8 +1,13 @@
 import gc
+import importlib
+import os
+import sys
 import torch
+import torch.distributed as dist
 from argparse import ArgumentParser
-from datasets import load_dataset
 from tqdm import tqdm
+import transformers.utils as tf_utils
+import transformers.utils.import_utils as tf_import_utils
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM
 from transformers import AutoModelForImageTextToText
@@ -16,6 +21,36 @@ from utils.clip import magnitude_clip
 from utils.device import clear_device_cache, get_preferred_device, resolve_device_map, synchronize_device
 
 
+# Compatibility shim for some remote model repos that still import the old helper
+# name from transformers.utils.
+if not hasattr(tf_utils, "is_flash_attn_greater_or_equal_2_10"):
+    def _is_flash_attn_greater_or_equal_2_10() -> bool:
+        if hasattr(tf_utils, "is_flash_attn_greater_or_equal"):
+            try:
+                return tf_utils.is_flash_attn_greater_or_equal("2.10")
+            except TypeError:
+                # Older/newer signatures can differ; conservative fallback.
+                return bool(tf_utils.is_flash_attn_greater_or_equal())
+        return False
+
+    tf_utils.is_flash_attn_greater_or_equal_2_10 = _is_flash_attn_greater_or_equal_2_10
+
+# Compatibility shim for remote repos expecting the older import_utils helper.
+if not hasattr(tf_import_utils, "is_torch_fx_available"):
+    def _is_torch_fx_available() -> bool:
+        if not hasattr(tf_import_utils, "is_torch_available"):
+            return False
+        if not tf_import_utils.is_torch_available():
+            return False
+        try:
+            import torch.fx  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    tf_import_utils.is_torch_fx_available = _is_torch_fx_available
+
+
 def welford_gpu_batched_multilayer_float32(
     formatted_prompts: list[str],
     desc: str,
@@ -27,24 +62,27 @@ def welford_gpu_batched_multilayer_float32(
     clip: float = 1.0,
     processor = None,  # Add processor parameter
     is_vision_model: bool = False,  # Add flag for vision models
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> dict[int, torch.Tensor]:
     text_config = model.config
     if hasattr(text_config, "text_config"):
         text_config = text_config.text_config
-    vocab_size = text_config.vocab_size
+    hidden_size = getattr(text_config, "hidden_size", None)
 
     max_tokens = position
 
-    means = {layer_idx: None for layer_idx in layer_indices}
+    sums = {layer_idx: None for layer_idx in layer_indices}
     counts = {layer_idx: 0 for layer_idx in layer_indices}
-    dtype = model.dtype
+    show_progress = rank == 0
 
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
     if is_vision_model and processor is not None:
         processor.tokenizer.padding_side = 'left'
 
-    for i in tqdm(range(0, len(formatted_prompts), batch_size), desc=desc):
+    for i in tqdm(range(0, len(formatted_prompts), batch_size), desc=desc, disable=not show_progress):
         batch_prompts = formatted_prompts[i:i+batch_size]
 
         if is_vision_model and processor is not None:
@@ -105,35 +143,87 @@ def welford_gpu_batched_multilayer_float32(
                 current_hidden = magnitude_clip(current_hidden, clip)
 
             batch_size_actual = current_hidden.size(dim=0)
-            total_count = counts[layer_idx] + batch_size_actual
-
-            if means[layer_idx] is None:
-                # Initialize mean in float64
-                means[layer_idx] = current_hidden.double().mean(dim=0)
+            if sums[layer_idx] is None:
+                sums[layer_idx] = current_hidden.double().sum(dim=0)
             else:
-                # All operations in float64 (means[layer_idx] is already float64)
-                batch_mean = current_hidden.double().mean(dim=0)
-                delta = batch_mean - means[layer_idx]
-                means[layer_idx] += delta * batch_size_actual / total_count
+                sums[layer_idx] += current_hidden.double().sum(dim=0)
 
-                #delta = current_hidden.double() - means[layer_idx]
-                #means[layer_idx] += delta.sum(dim=0) / total_count
-
-            counts[layer_idx] = total_count
+            counts[layer_idx] += batch_size_actual
             del current_hidden
 
         del hidden_states
         #del last_non_pad
         clear_device_cache()
 
-    # Move to CPU
-    return_dict = {
-        layer_idx: mean.to(device="cpu")
-        for layer_idx, mean in means.items()
-    }
-    del means
+    # Reduce global sums/counts across ranks when distributed, then compute means.
+    return_dict = {}
+    for layer_idx in layer_indices:
+        local_sum = sums[layer_idx]
+        if local_sum is None:
+            if hidden_size is None:
+                raise ValueError("Could not infer hidden size for distributed reduction")
+            reduce_device = model.device if hasattr(model, "device") else "cpu"
+            local_sum = torch.zeros(hidden_size, dtype=torch.float64, device=reduce_device)
+
+        local_count_t = torch.tensor(float(counts[layer_idx]), dtype=torch.float64, device=local_sum.device)
+
+        if distributed and world_size > 1:
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_count_t, op=dist.ReduceOp.SUM)
+
+        global_count = int(local_count_t.item())
+        if global_count == 0:
+            raise ValueError(f"No prompts available to measure for layer {layer_idx}")
+
+        mean = local_sum / float(global_count)
+        return_dict[layer_idx] = mean.to(device="cpu")
+
+    del sums
     clear_device_cache()
     return return_dict
+
+
+def init_distributed(
+    enabled: bool,
+    backend: str | None = None,
+    master_addr: str | None = None,
+    master_port: int | None = None,
+    rank: int | None = None,
+    world_size: int | None = None,
+) -> tuple[bool, int, int, int]:
+    if not enabled:
+        return False, 0, 1, 0
+
+    if master_addr:
+        os.environ["MASTER_ADDR"] = master_addr
+    if master_port:
+        os.environ["MASTER_PORT"] = str(master_port)
+    if rank is not None:
+        os.environ["RANK"] = str(rank)
+    if world_size is not None:
+        os.environ["WORLD_SIZE"] = str(world_size)
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available in this PyTorch build")
+
+    inferred_backend = backend or ("nccl" if torch.cuda.is_available() else "gloo")
+    if not dist.is_initialized():
+        dist.init_process_group(backend=inferred_backend, init_method="env://")
+
+    rank_v = dist.get_rank()
+    world_size_v = dist.get_world_size()
+    local_rank_v = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank_v)
+
+    return True, rank_v, world_size_v, local_rank_v
+
+
+def shard_list_for_rank(items: list[str], rank: int, world_size: int) -> list[str]:
+    if world_size <= 1:
+        return items
+    return items[rank::world_size]
 
 def format_chats(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
@@ -164,6 +254,9 @@ def compute_refusals(
     processor = None,  # processor parameter
     is_vision_model: bool = False,  # flag for vision models
     token2: bool = False, # measure at second token instead of first
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> torch.Tensor:
     # dtype = model.dtype
     if hasattr(model, "language_model"):
@@ -183,14 +276,16 @@ def compute_refusals(
     harmful_formatted = format_chats(tokenizer=tokenizer, prompt_list=harmful_list, processor=processor)
     harmful_means = welford_gpu_batched_multilayer_float32(
         harmful_formatted, "Generating harmful outputs", model, tokenizer,
-        focus_layers, pos, inference_batch_size, clip, processor, is_vision_model
+        focus_layers, pos, inference_batch_size, clip, processor, is_vision_model,
+        distributed, rank, world_size,
     )
     clear_device_cache()
     del harmful_formatted
     harmless_formatted = format_chats(tokenizer=tokenizer, prompt_list=harmless_list, processor=processor)
     harmless_means = welford_gpu_batched_multilayer_float32(
         harmless_formatted, "Generating harmless outputs", model, tokenizer, 
-        focus_layers, pos, inference_batch_size, clip, processor, is_vision_model
+        focus_layers, pos, inference_batch_size, clip, processor, is_vision_model,
+        distributed, rank, world_size,
     )
     del harmless_formatted
 
@@ -198,7 +293,7 @@ def compute_refusals(
     results["layers"] = num_layers
 
     # Keep all results in 32-bit float for analysis/ablation
-    for layer in tqdm(focus_layers,desc="Compiling layer measurements"):
+    for layer in tqdm(focus_layers, desc="Compiling layer measurements", disable=rank != 0):
         harmful_mean = harmful_means[layer]
         results[f'harmful_{layer}'] = harmful_mean.to(dtype=model.dtype)
         harmless_mean = harmless_means[layer]
@@ -342,6 +437,55 @@ if __name__ == "__main__":
         default=False,
         help="Measure after second token instead of after first token",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help="Allow execution of custom model/tokenizer code from model repository",
+    )
+    parser.add_argument(
+        "--allow-model-compression",
+        action="store_true",
+        default=False,
+        help="Allow model repo quantization/compression metadata when --quant-measure is not set",
+    )
+    parser.add_argument(
+        "--dist",
+        action="store_true",
+        default=False,
+        help="Enable torch.distributed multi-process measurement",
+    )
+    parser.add_argument(
+        "--dist-backend",
+        type=str,
+        choices=["nccl", "gloo", "mpi"],
+        default=None,
+        help="Distributed backend (default: nccl on CUDA, else gloo)",
+    )
+    parser.add_argument(
+        "--master-addr",
+        type=str,
+        default=None,
+        help="MASTER_ADDR override for multi-node torchrun",
+    )
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=None,
+        help="MASTER_PORT override for multi-node torchrun",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="RANK override when not provided by torchrun",
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help="WORLD_SIZE override when not provided by torchrun",
+    )
 
     args = parser.parse_args()
 
@@ -351,14 +495,52 @@ if __name__ == "__main__":
         isinstance(args.output, str)
     )
 
+    qbit = args.quant_measure
+
+    dist_enabled, rank, world_size, local_rank = init_distributed(
+        enabled=args.dist,
+        backend=args.dist_backend,
+        master_addr=args.master_addr,
+        master_port=args.master_port,
+        rank=args.rank,
+        world_size=args.world_size,
+    )
+
     torch.inference_mode()
     torch.set_grad_enabled(False)
 
     device = get_preferred_device()
     device_map = resolve_device_map()
+    if dist_enabled and device == "cuda":
+        # One process per GPU under torchrun; avoid each rank claiming all local GPUs.
+        device_map = {"": local_rank}
+        if rank == 0:
+            print(f"Distributed mode enabled: world_size={world_size}, backend={dist.get_backend()}")
+    elif dist_enabled and rank == 0:
+        print(f"Distributed mode enabled on {device}: world_size={world_size}, backend={dist.get_backend()}")
 
     model = args.model
-    model_config = AutoConfig.from_pretrained(model)
+    model_config = AutoConfig.from_pretrained(
+        model,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+    # Loading policy:
+    # - If --quant-measure is set, preserve model quantization metadata and normalize
+    #   quantization_config=None -> {} for remote repos that otherwise crash.
+    # - Otherwise, default to full-precision by removing model-provided
+    #   quantization/compression metadata, unless explicitly allowed.
+    if qbit:
+        if hasattr(model_config, "quantization_config") and getattr(model_config, "quantization_config") is None:
+            setattr(model_config, "quantization_config", {})
+    elif not args.allow_model_compression:
+        for _cfg_attr in ("quantization_config", "compression_config"):
+            if hasattr(model_config, _cfg_attr):
+                try:
+                    delattr(model_config, _cfg_attr)
+                except Exception:
+                    setattr(model_config, _cfg_attr, None)
+
     model_type = getattr(model_config,"model_type")
 
     # Get the precision/dtype from config, with proper fallback
@@ -376,33 +558,27 @@ if __name__ == "__main__":
             precision = torch.float32
 
     has_vision = False
-    if hasattr(model_config,"vision_config"):
+    if hasattr(model_config, "vision_config"):
         has_vision = True
     model_loader = AutoModelForCausalLM
-    if (has_vision):
-        model_loader = AutoModelForImageTextToText
 
     quant_config = None
-    qbit = args.quant_measure
 
     if device == "mps" and qbit:
         print("BitsAndBytes quantization is not supported on MPS; disabling requested quantization.")
         qbit = None
 
-    # autodetect BitsAndBytes quant; overrides option
-    if hasattr(model_config,"quantization_config"):
-        bnb_config = getattr(model_config, "quantization_config")
-        if (bnb_config["load_in_4bit"] == True):
-            if device == "mps":
-                raise RuntimeError("BitsAndBytes 4-bit models are not supported on MPS. Please use CPU/CUDA or load full-precision weights.")
-            qbit = "4bit"
-            # Override precision with compute dtype from quant config if available
-            if "bnb_4bit_compute_dtype" in bnb_config and bnb_config["bnb_4bit_compute_dtype"]:
-                precision = bnb_config["bnb_4bit_compute_dtype"]
-        elif (bnb_config["load_in_8bit"] == True):
-            if device == "mps":
-                raise RuntimeError("BitsAndBytes 8-bit models are not supported on MPS. Please use CPU/CUDA or load full-precision weights.")
-            qbit = "8bit"
+    # Quantization is opt-in only: no automatic detection from model config.
+    # Full-precision loading remains the default unless --quant-measure is set.
+    if qbit:
+        if rank == 0:
+            print(f"Load mode: explicit bitsandbytes {qbit} quantization (--quant-measure).")
+    elif args.allow_model_compression:
+        if rank == 0:
+            print("Load mode: allowing model-defined quantization/compression metadata.")
+    else:
+        if rank == 0:
+            print("Load mode: forcing full-precision load; ignoring model-defined quantization/compression metadata.")
 
     # Convert string dtype to torch dtype if needed
     if isinstance(precision, str):
@@ -445,29 +621,133 @@ if __name__ == "__main__":
         harmless_list = load_data("./data/harmless.parquet")
 
     if args.deccp:
+        from datasets import load_dataset
         deccp_list = load_dataset("augmxnt/deccp", split="censored")
         harmful_list += deccp_list["text"]
 
-    attn_impl = "flash_attention_2" if args.flash_attn and device == "cuda" else None
+    if dist_enabled and world_size > 1:
+        harmful_list = shard_list_for_rank(harmful_list, rank, world_size)
+        harmless_list = shard_list_for_rank(harmless_list, rank, world_size)
+        if rank == 0:
+            print("Sharding prompt datasets across distributed ranks for data-parallel measurement.")
 
-    if hasattr(model_config, "quantization_config"):
-        model = AutoModelForCausalLM.from_pretrained(
+    # Kimi-K2.5 remote code may default parts of the model (e.g., vision tower)
+    # to flash_attention_2, which can fail on unsupported submodules. Unless
+    # explicitly requested, force eager attention for widest compatibility.
+    attn_impl = "flash_attention_2" if args.flash_attn and device == "cuda" else "eager"
+    if attn_impl == "eager":
+        setattr(model_config, "_attn_implementation", "eager")
+        if hasattr(model_config, "text_config") and getattr(model_config, "text_config") is not None:
+            setattr(model_config.text_config, "_attn_implementation", "eager")
+        if hasattr(model_config, "vision_config") and getattr(model_config, "vision_config") is not None:
+            setattr(model_config.vision_config, "_attn_implementation", "eager")
+
+    # Kimi-K2.5 remote modeling bug workaround:
+    # MoonViT3dEncoder.__init__ references self.use_deterministic_attn before
+    # setting it. Providing a class default prevents AttributeError while keeping
+    # behavior deterministic=False unless remote code overrides it.
+    if args.trust_remote_code:
+        try:
+            kimi_mod = importlib.import_module(
+                "transformers_modules.Kimi_hyphen_K2_dot_5.modeling_kimi_k25"
+            )
+            if hasattr(kimi_mod, "MoonViT3dEncoder") and not hasattr(kimi_mod.MoonViT3dEncoder, "use_deterministic_attn"):
+                setattr(kimi_mod.MoonViT3dEncoder, "use_deterministic_attn", False)
+        except Exception:
+            # Best effort only; if module path differs we continue without patch.
+            pass
+
+    def _load_model_with_current_loader():
+        return model_loader.from_pretrained(
             args.model,
-#            trust_remote_code=True,
-            dtype=precision,
-            device_map=device_map,
-            attn_implementation=attn_impl,
-        )
-    else:
-        model = model_loader.from_pretrained(
-            args.model,
-#            trust_remote_code=True,
+            trust_remote_code=args.trust_remote_code,
+            config=model_config,
             dtype=precision,
             low_cpu_mem_usage=True,
             device_map=device_map,
-            quantization_config=quant_config,
             attn_implementation=attn_impl,
+            **({"quantization_config": quant_config} if quant_config is not None else {}),
         )
+
+    def _patch_one_kimi_module(mod) -> bool:
+        patched = False
+
+        encoder_cls = getattr(mod, "MoonViT3dEncoder", None)
+        if encoder_cls is not None and not getattr(encoder_cls, "_roo_patched_use_det", False):
+            original_init = encoder_cls.__init__
+
+            def _patched_init(self, *init_args, **init_kwargs):
+                self.use_deterministic_attn = False
+                return original_init(self, *init_args, **init_kwargs)
+
+            encoder_cls.__init__ = _patched_init
+            encoder_cls._roo_patched_use_det = True
+            patched = True
+
+        kimi_cls = getattr(mod, "KimiK25ForConditionalGeneration", None)
+        if kimi_cls is not None and not getattr(kimi_cls, "_roo_patched_tie_weights", False):
+            original_tie_weights = kimi_cls.tie_weights
+
+            def _patched_tie_weights(self, *tw_args, **tw_kwargs):
+                # transformers>=5.4 may pass recompute_mapping kwarg.
+                return original_tie_weights(self)
+
+            kimi_cls.tie_weights = _patched_tie_weights
+            kimi_cls._roo_patched_tie_weights = True
+            patched = True
+
+        return patched
+
+    def _patch_kimi_remote_code_compat() -> bool:
+        patched = False
+
+        # Try canonical dynamic-module path first.
+        try:
+            mod = importlib.import_module("transformers_modules.Kimi_hyphen_K2_dot_5.modeling_kimi_k25")
+            patched = _patch_one_kimi_module(mod) or patched
+        except Exception:
+            pass
+
+        # Also patch any already-loaded copies.
+        for mod_name, mod in list(sys.modules.items()):
+            if mod_name.endswith("modeling_kimi_k25"):
+                patched = _patch_one_kimi_module(mod) or patched
+
+        return patched
+
+    # Prefer text-only loader first; some configs expose vision_config but are not
+    # registered under AutoModelForImageTextToText. Retry with compatibility patches
+    # when remote code expects older transformers internals.
+    load_error = None
+    for _ in range(3):
+        try:
+            model = _load_model_with_current_loader()
+            load_error = None
+            break
+        except Exception as e:
+            load_error = e
+            err = str(e)
+
+            if isinstance(e, ValueError) and has_vision:
+                if rank == 0:
+                    print(f"Vision/text loader mismatch ({e}); retrying with AutoModelForCausalLM.")
+                has_vision = False
+                model_loader = AutoModelForCausalLM
+                continue
+
+            needs_kimi_patch = (
+                "use_deterministic_attn" in err
+                or "tie_weights() got an unexpected keyword argument 'recompute_mapping'" in err
+            )
+            if needs_kimi_patch and _patch_kimi_remote_code_compat():
+                if rank == 0:
+                    print("Applied Kimi remote-code compatibility patches; retrying model load.")
+                continue
+
+            break
+
+    if load_error is not None:
+        raise load_error
     model.requires_grad_(False)
     if has_tied_weights(model_type):
         model.tie_weights()
@@ -498,30 +778,34 @@ if __name__ == "__main__":
         try:
             processor = AutoProcessor.from_pretrained(
                 args.model,
+                trust_remote_code=args.trust_remote_code,
                 device_map=device_map,
                 padding=True,
             )
             tokenizer = processor.tokenizer
-            print("Loaded processor for vision model")
+            if rank == 0:
+                print("Loaded processor for vision model")
         except (IndexError, Exception) as e:
             # If processor loading fails, fall back to tokenizer only
-            print(f"Could not load processor ({e}), falling back to tokenizer only")
+            if rank == 0:
+                print(f"Could not load processor ({e}), falling back to tokenizer only")
             has_vision = False
             tokenizer = AutoTokenizer.from_pretrained(
                 args.model,
-#                trust_remote_code=True,
+                trust_remote_code=args.trust_remote_code,
                 device_map=device_map,
                 padding=True,
             )
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             args.model,
-#            trust_remote_code=True,
+            trust_remote_code=args.trust_remote_code,
             device_map=device_map,
             padding=True,
         )
 
-    print("Computing refusal information...")
+    if rank == 0:
+        print("Computing refusal information...")
     results = {}
     results = compute_refusals(
         model=model,
@@ -534,12 +818,24 @@ if __name__ == "__main__":
         processor=processor,
         is_vision_model=has_vision,
         token2=args.token2,
+        distributed=dist_enabled,
+        rank=rank,
+        world_size=world_size,
     )
 
-    print(f"Saving refusal information to {args.output}...")
-    torch.save(results, args.output)
+    if dist_enabled:
+        dist.barrier()
+
+    if rank == 0:
+        print(f"Saving refusal information to {args.output}...")
+        torch.save(results, args.output)
 
     # Release VRAM so next measurement can start immediately
-    print("Unloading model and clearing memory...")
+    if rank == 0:
+        print("Unloading model and clearing memory...")
     del model, tokenizer, processor, results
     clean_up()
+
+    if dist_enabled and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
